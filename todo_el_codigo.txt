@@ -1,0 +1,879 @@
+=== ARCHIVO: /root/tango-apk/src/list-apk.hpp ===
+#ifndef LIST_APK_HPP
+#define LIST_APK_HPP
+
+#include <string>
+
+void cmd_list_apk(const std::string& root_dir);
+
+#endif // LIST_APK_HPP
+
+
+=== ARCHIVO: /root/tango-apk/src/cli-apk.hpp ===
+#ifndef CLI_APK_HPP
+#define CLI_APK_HPP
+
+#include <string>
+#include <vector>
+#include <cstddef>
+#include <unordered_set>
+
+namespace CLI_APK {
+
+    const std::unordered_set<std::string> PROTECTED_PACKAGES = {
+        "musl", "busybox", "apk-tools", "zstd", "tar"
+    };
+
+    std::string formatSize(size_t bytes);
+    bool confirm(const std::string& prompt_msg = "¿Desea continuar?");
+    void showProgressBar(size_t current, size_t total, const std::string& prefix = "");
+
+    void printTransactionSummary(
+        const std::vector<std::string>& explicit_pkgs,
+        const std::vector<std::string>& deps_pkgs,
+        size_t total_download_bytes,
+        size_t total_install_bytes
+    );
+
+    void printDeleteSummary(
+        const std::vector<std::string>& explicit_pkgs,
+        const std::vector<std::string>& orphan_deps_pkgs,
+        size_t total_freed_bytes
+    );
+
+    void printSuccess(const std::string& msg);
+    void printError(const std::string& msg);
+    void printWarning(const std::string& msg);
+    void printInfo(const std::string& msg);
+
+} // namespace CLI_APK
+
+#endif // CLI_APK_HPP
+
+
+=== ARCHIVO: /root/tango-apk/src/upgrade-apk.cpp ===
+#include "upgrade-apk.hpp"
+#include "sync-apk.hpp"
+#include "cli-apk.hpp"
+#include <iostream>
+#include <filesystem>
+
+namespace fs = std::filesystem;
+
+namespace RogerAPK {
+
+void cmd_upgrade_apk(const std::string& root_dir) {
+    CLI_APK::printInfo("Verificando actualizaciones del sistema APK...");
+    cmd_sync_apk(root_dir);
+
+    // Lógica para comparar versiones entre installed/ y repo_index
+    CLI_APK::printInfo("Todos los paquetes instalados están actualizados.");
+}
+
+} // namespace RogerAPK
+
+
+=== ARCHIVO: /root/tango-apk/src/rogersat-apk.hpp ===
+#ifndef ROGER_SAT_APK_HPP
+#define ROGER_SAT_APK_HPP
+
+#include <iostream>
+#include <string>
+#include <vector>
+#include <map>
+#include <set>
+#include <algorithm>
+#include <cstdint>
+#include <minisat/core/Solver.h>
+
+namespace RogerAPK {
+
+struct PackageSpec {
+    std::string name;
+    std::string version;
+    std::string url;
+    std::string sha256;
+    uint64_t size = 0;           // Tamaño de descarga (campo S:)
+    uint64_t installed_size = 0; // Tamaño instalado en disco (campo I:)
+    std::vector<std::string> depends;
+    bool explicit_installed = false;
+};
+
+class DependencyResolverSAT {
+private:
+    std::map<std::string, PackageSpec> db;
+
+    std::string cleanDepName(const std::string& raw_dep) const {
+        std::string dep = raw_dep;
+        if (dep.rfind("so:", 0) == 0 || dep.rfind("cmd:", 0) == 0 || dep.rfind("pc:", 0) == 0) {
+            return "";
+        }
+        size_t op_pos = dep.find_first_of("=<>-~");
+        if (op_pos != std::string::npos) {
+            dep = dep.substr(0, op_pos);
+        }
+        dep.erase(0, dep.find_first_not_of(" \t"));
+        dep.erase(dep.find_last_not_of(" \t\r\n") + 1);
+        return dep;
+    }
+
+public:
+    void addPackage(const PackageSpec& pkg) {
+        db[pkg.name] = pkg;
+    }
+
+    // Identifica paquetes absolutamente esenciales para la supervivencia del sistema/runtime
+    bool isVitalPackage(const std::string& name) const {
+        // Chequeo de librerías esenciales y herramientas base del gestor
+        if (name == "musl" || name == "libc" || name == "glibc" || 
+            name == "tar" || name == "zstd" || name == "curl" || name == "apk-tools") {
+            return true;
+        }
+        return false;
+    }
+
+    // Calcula de forma dinámica qué paquetes instalados se romperían si se elimina 'target'
+    std::vector<std::string> findReverseDependencies(const std::string& target, const std::set<std::string>& installed_pkgs) {
+        std::vector<std::string> affected;
+        for (const auto& pkg_name : installed_pkgs) {
+            if (pkg_name == target) continue;
+            auto it = db.find(pkg_name);
+            if (it != db.end()) {
+                for (const auto& raw_dep : it->second.depends) {
+                    if (cleanDepName(raw_dep) == target) {
+                        affected.push_back(pkg_name);
+                        break;
+                    }
+                }
+            }
+        }
+        return affected;
+    }
+
+    bool resolveInstall(const std::string& target, std::vector<std::string>& out_install_list) {
+        if (db.find(target) == db.end()) {
+            std::cerr << "[ERROR] El paquete APK '" << target << "' no existe en el índice.\n";
+            return false;
+        }
+
+        Minisat::Solver solver;
+        std::map<std::string, Minisat::Var> pkg_to_var;
+
+        for (const auto& [name, pkg] : db) {
+            pkg_to_var[name] = solver.newVar();
+        }
+
+        for (const auto& [name, pkg] : db) {
+            Minisat::Var p_var = pkg_to_var[name];
+            for (const auto& raw_dep : pkg.depends) {
+                std::string dep = cleanDepName(raw_dep);
+                if (dep.empty() || dep == name) continue;
+
+                if (pkg_to_var.find(dep) == pkg_to_var.end()) {
+                    continue; 
+                }
+
+                Minisat::Var dep_var = pkg_to_var[dep];
+                Minisat::vec<Minisat::Lit> clause;
+                clause.push(~Minisat::mkLit(p_var));
+                clause.push(Minisat::mkLit(dep_var));
+                solver.addClause_(clause);
+            }
+        }
+
+        solver.addClause(Minisat::mkLit(pkg_to_var[target]));
+
+        if (solver.solve()) {
+            out_install_list.clear();
+            for (const auto& [name, var] : pkg_to_var) {
+                if (solver.modelValue(var) == Minisat::l_True) {
+                    out_install_list.push_back(name);
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+};
+
+} // namespace RogerAPK
+
+#endif // ROGER_SAT_APK_HPP
+
+
+=== ARCHIVO: /root/tango-apk/src/list-apk.cpp ===
+#include "list-apk.hpp"
+#include "cli-apk.hpp"
+#include <iostream>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <iomanip>
+
+namespace fs = std::filesystem;
+
+void cmd_list_apk(const std::string& root_dir) {
+    // Apunta a la base de datos exclusiva de roger-apk
+    fs::path db_path = fs::path(root_dir) / "var/lib/roger-apk/installed";
+
+    if (!fs::exists(db_path) || fs::is_empty(db_path)) {
+        CLI_APK::printInfo("No hay paquetes APK instalados en el sistema.");
+        return;
+    }
+
+    std::map<std::string, std::string> installed_pkgs; // <nombre, versión>
+
+    for (const auto& entry : fs::directory_iterator(db_path)) {
+        if (entry.path().extension() == ".meta") {
+            std::ifstream file(entry.path());
+            std::string line;
+            std::string pkg_name, pkg_version;
+
+            while (std::getline(file, line)) {
+                size_t colon = line.find(':');
+                if (colon != std::string::npos) {
+                    std::string key = line.substr(0, colon);
+                    std::string val = line.substr(colon + 1);
+
+                    val.erase(0, val.find_first_not_of(" \t"));
+                    val.erase(val.find_last_not_of(" \t\r\n") + 1);
+
+                    if (key == "pkgname") pkg_name = val;
+                    else if (key == "version") pkg_version = val;
+                }
+            }
+
+            if (!pkg_name.empty()) {
+                installed_pkgs[pkg_name] = pkg_version;
+            }
+        }
+    }
+
+    if (installed_pkgs.empty()) {
+        CLI_APK::printInfo("No se encontraron metadatos de paquetes APK.");
+        return;
+    }
+
+    std::cout << "\nPaquetes APK instalados (" << installed_pkgs.size() << "):\n";
+    std::cout << "----------------------------------------\n";
+    for (const auto& [name, version] : installed_pkgs) {
+        std::cout << " - " << std::left << std::setw(25) << name << " " << version << "\n";
+    }
+    std::cout << "----------------------------------------\n";
+}
+
+
+=== ARCHIVO: /root/tango-apk/src/install-apk.hpp ===
+#ifndef INSTALL_APK_HPP
+#define INSTALL_APK_HPP
+
+#include <string>
+#include <vector>
+
+namespace RogerAPK {
+
+void cmd_install_apk(const std::string& root_dir, const std::vector<std::string>& targets);
+
+} // namespace RogerAPK
+
+#endif // INSTALL_APK_HPP
+
+
+=== ARCHIVO: /root/tango-apk/src/delete-apk.cpp ===
+#include "delete-apk.hpp"
+#include "rogersat-apk.hpp"
+#include "cli-apk.hpp"
+#include <iostream>
+#include <filesystem>
+#include <algorithm>
+
+namespace fs = std::filesystem;
+
+namespace RogerAPK {
+
+void cmd_delete_apk(const std::string& root_dir, const std::vector<std::string>& targets) {
+    if (targets.empty()) {
+        CLI_APK::printError("Debe especificar al menos un paquete para eliminar.");
+        return;
+    }
+
+    DependencyResolverSAT resolver;
+    for (const auto& target : targets) {
+        if (resolver.isVitalPackage(target) || CLI_APK::PROTECTED_PACKAGES.count(target)) {
+            CLI_APK::printError("El paquete '" + target + "' está protegido por el sistema base y no se puede eliminar.");
+            return;
+        }
+    }
+
+    CLI_APK::printDeleteSummary(targets, {}, 1024 * 512);
+
+    if (!CLI_APK::confirm("¿Está seguro de que desea desinstalar estos paquetes?")) {
+        CLI_APK::printWarning("Operación cancelada.");
+        return;
+    }
+
+    fs::path installed_dir = fs::path(root_dir) / "var/lib/roger-apk/installed";
+
+    for (const auto& pkg : targets) {
+        fs::path meta_path = installed_dir / (pkg + ".meta");
+        if (fs::exists(meta_path)) {
+            fs::remove(meta_path);
+            CLI_APK::printSuccess("Removido: " + pkg);
+        } else {
+            CLI_APK::printWarning("El paquete no estaba instalado: " + pkg);
+        }
+    }
+}
+
+} // namespace RogerAPK
+
+
+=== ARCHIVO: /root/tango-apk/src/bomb-apk.cpp ===
+#include "bomb-apk.hpp"
+#include "cli-apk.hpp"
+#include <iostream>
+#include <filesystem>
+
+namespace fs = std::filesystem;
+
+namespace RogerAPK {
+
+void cmd_bomb_apk(const std::string& root_dir) {
+    CLI_APK::printWarning("¡ADVERTENCIA! El comando BOMB eliminará TODOS los paquetes no protegidos.");
+    
+    if (!CLI_APK::confirm("¿Desea purgar completamente el entorno APK instalados?")) {
+        CLI_APK::printInfo("Operación de purga abortada.");
+        return;
+    }
+
+    fs::path db_path = fs::path(root_dir) / "var/lib/roger-apk/installed";
+    if (fs::exists(db_path)) {
+        for (const auto& entry : fs::directory_iterator(db_path)) {
+            std::string stem = entry.path().stem().string();
+            if (CLI_APK::PROTECTED_PACKAGES.count(stem) == 0) {
+                fs::remove(entry.path());
+                CLI_APK::printInfo("Purgado: " + stem);
+            }
+        }
+    }
+    CLI_APK::printSuccess("Entorno purgado con éxito.");
+}
+
+} // namespace RogerAPK
+
+
+=== ARCHIVO: /root/tango-apk/src/delete-apk.hpp ===
+#ifndef DELETE_APK_HPP
+#define DELETE_APK_HPP
+
+#include <string>
+#include <vector>
+
+namespace RogerAPK {
+
+void cmd_delete_apk(const std::string& root_dir, const std::vector<std::string>& targets);
+
+} // namespace RogerAPK
+
+#endif // DELETE_APK_HPP
+
+
+=== ARCHIVO: /root/tango-apk/src/sync-apk.cpp ===
+#include "sync-apk.hpp"
+#include "cli-apk.hpp"
+#include <iostream>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+
+namespace fs = std::filesystem;
+
+namespace RogerAPK {
+
+static void parseAPKINDEXFile(const fs::path& filepath, std::ofstream& out_db) {
+    if (!fs::exists(filepath)) {
+        CLI_APK::printWarning("No se encontró el índice: " + filepath.string());
+        return;
+    }
+
+    std::ifstream file(filepath);
+    std::string line;
+    std::string pkgname, version, depends, size = "0", installed_size = "0";
+
+    auto write_entry = [&]() {
+        if (!pkgname.empty()) {
+            out_db << "pkgname: " << pkgname << "\n";
+            out_db << "version: " << version << "\n";
+            out_db << "size: " << size << "\n";
+            out_db << "installed_size: " << installed_size << "\n";
+            out_db << "depends: " << depends << "\n";
+            out_db << "---\n";
+        }
+    };
+
+    while (std::getline(file, line)) {
+        if (line.empty()) {
+            write_entry();
+            pkgname.clear();
+            version.clear();
+            depends.clear();
+            size = "0";
+            installed_size = "0";
+            continue;
+        }
+
+        if (line.rfind("P:", 0) == 0) pkgname = line.substr(2);
+        else if (line.rfind("V:", 0) == 0) version = line.substr(2);
+        else if (line.rfind("S:", 0) == 0) size = line.substr(2);
+        else if (line.rfind("I:", 0) == 0) installed_size = line.substr(2);
+        else if (line.rfind("D:", 0) == 0) depends = line.substr(2);
+    }
+    write_entry();
+}
+
+void cmd_sync_apk(const std::string& root_dir) {
+    CLI_APK::printInfo("Procesando índices APKINDEX locales...");
+
+    fs::path db_dir = fs::path(root_dir) / "var/lib/roger-apk";
+    fs::create_directories(db_dir);
+    fs::path repo_index = db_dir / "repo_index";
+
+    std::ofstream out_file(repo_index);
+    if (!out_file.is_open()) {
+        CLI_APK::printError("No se pudo escribir en el índice del repositorio.");
+        return;
+    }
+
+    fs::path base_dir = "/root/tango-apk";
+
+    CLI_APK::printInfo("Indexando APKINDEX-main...");
+    parseAPKINDEXFile(base_dir / "APKINDEX-main", out_file);
+
+    CLI_APK::printInfo("Indexando APKINDEX-extra...");
+    parseAPKINDEXFile(base_dir / "APKINDEX-extra", out_file);
+
+    out_file.close();
+    CLI_APK::printSuccess("Base de datos local sincronizada con éxito.");
+}
+
+void cmd_update_apk(const std::string& root_dir) {
+    cmd_sync_apk(root_dir);
+}
+
+} // namespace RogerAPK
+
+
+=== ARCHIVO: /root/tango-apk/src/cli-apk.cpp ===
+#include "cli-apk.hpp"
+#include <iostream>
+#include <iomanip>
+#include <sstream>
+
+namespace CLI_APK {
+
+std::string formatSize(size_t bytes) {
+    const char* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    double size = static_cast<double>(bytes);
+    int unit_idx = 0;
+
+    while (size >= 1024.0 && unit_idx < 4) {
+        size /= 1024.0;
+        unit_idx++;
+    }
+
+    std::ostringstream ss;
+    ss << std::fixed << std::setprecision(2) << size << " " << units[unit_idx];
+    return ss.str();
+}
+
+bool confirm(const std::string& prompt_msg) {
+    std::cout << prompt_msg << " [S/n]: ";
+    std::string response;
+    if (!std::getline(std::cin, response)) return false;
+    
+    if (response.empty() || response == "s" || response == "S" || response == "si" || response == "SI" || response == "y" || response == "Y") {
+        return true;
+    }
+    return false;
+}
+
+void showProgressBar(size_t current, size_t total, const std::string& prefix) {
+    if (total == 0) return;
+    const int bar_width = 30;
+    float progress = static_cast<float>(current) / total;
+    int pos = static_cast<int>(bar_width * progress);
+
+    std::cout << "\r" << prefix << " [";
+    for (int i = 0; i < bar_width; ++i) {
+        if (i < pos) std::cout << "=";
+        else if (i == pos) std::cout << ">";
+        else std::cout << " ";
+    }
+    std::cout << "] " << int(progress * 100.0) << "% (" << current << "/" << total << ")" << std::flush;
+    if (current == total) {
+        std::cout << std::endl;
+    }
+}
+
+void printTransactionSummary(
+    const std::vector<std::string>& explicit_pkgs,
+    const std::vector<std::string>& deps_pkgs,
+    size_t total_download_bytes,
+    size_t total_install_bytes
+) {
+    std::cout << "\n=========================================\n";
+    std::cout << "     RESUMEN DE TRANSACCIÓN (ROGER-APK)  \n";
+    std::cout << "=========================================\n";
+
+    if (!explicit_pkgs.empty()) {
+        std::cout << "Paquetes solicitados (" << explicit_pkgs.size() << "):\n  ";
+        for (const auto& pkg : explicit_pkgs) std::cout << pkg << " ";
+        std::cout << "\n\n";
+    }
+
+    if (!deps_pkgs.empty()) {
+        std::cout << "Dependencias APK requeridas (" << deps_pkgs.size() << "):\n  ";
+        for (const auto& pkg : deps_pkgs) std::cout << pkg << " ";
+        std::cout << "\n\n";
+    }
+
+    std::cout << "Paquetes totales:         " << (explicit_pkgs.size() + deps_pkgs.size()) << "\n";
+    if (total_download_bytes > 0) {
+        std::cout << "Descarga estimada:       " << formatSize(total_download_bytes) << "\n";
+    }
+    if (total_install_bytes > 0) {
+        std::cout << "Espacio en disco extra:  " << formatSize(total_install_bytes) << "\n";
+    }
+    std::cout << "=========================================\n\n";
+}
+
+void printDeleteSummary(
+    const std::vector<std::string>& explicit_pkgs,
+    const std::vector<std::string>& orphan_deps_pkgs,
+    size_t total_freed_bytes
+) {
+    std::cout << "\n=========================================\n";
+    std::cout << "    ELIMINACIÓN DE PAQUETES (ROGER-APK)  \n";
+    std::cout << "=========================================\n";
+
+    if (!explicit_pkgs.empty()) {
+        std::cout << "Paquetes a eliminar (" << explicit_pkgs.size() << "):\n  ";
+        for (const auto& pkg : explicit_pkgs) std::cout << pkg << " ";
+        std::cout << "\n\n";
+    }
+
+    if (!orphan_deps_pkgs.empty()) {
+        std::cout << "Huérfanos a remover (" << orphan_deps_pkgs.size() << "):\n  ";
+        for (const auto& pkg : orphan_deps_pkgs) std::cout << pkg << " ";
+        std::cout << "\n\n";
+    }
+
+    std::cout << "Paquetes totales:           " << (explicit_pkgs.size() + orphan_deps_pkgs.size()) << "\n";
+    std::cout << "Espacio a liberar:          " << formatSize(total_freed_bytes) << "\n";
+    std::cout << "=========================================\n\n";
+}
+
+void printSuccess(const std::string& msg) {
+    std::cout << "[ROGER-APK OK] " << msg << "\n";
+}
+
+void printError(const std::string& msg) {
+    std::cerr << "[ROGER-APK ERROR] " << msg << "\n";
+}
+
+void printWarning(const std::string& msg) {
+    std::cout << "[ROGER-APK ADVERTENCIA] " << msg << "\n";
+}
+
+void printInfo(const std::string& msg) {
+    std::cout << "[ROGER-APK INFO] " << msg << "\n";
+}
+
+} // namespace CLI_APK
+
+
+=== ARCHIVO: /root/tango-apk/src/bomb-apk.hpp ===
+#ifndef BOMB_APK_HPP
+#define BOMB_APK_HPP
+
+#include <string>
+
+namespace RogerAPK {
+
+void cmd_bomb_apk(const std::string& root_dir);
+
+} // namespace RogerAPK
+
+#endif // BOMB_APK_HPP
+
+
+=== ARCHIVO: /root/tango-apk/src/install-apk.cpp ===
+#include "install-apk.hpp"
+#include "rogersat-apk.hpp"
+#include "cli-apk.hpp"
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <filesystem>
+#include <cstdlib>
+#include <algorithm>
+
+namespace fs = std::filesystem;
+
+namespace RogerAPK {
+
+static std::map<std::string, PackageSpec> loadRepoIndex(const std::string& root_dir) {
+    std::map<std::string, PackageSpec> db;
+    fs::path index_path = fs::path(root_dir) / "var/lib/roger-apk/repo_index";
+
+    if (!fs::exists(index_path)) return db;
+
+    std::ifstream file(index_path);
+    std::string line;
+    PackageSpec current;
+
+    while (std::getline(file, line)) {
+        if (line == "---") {
+            if (!current.name.empty()) db[current.name] = current;
+            current = PackageSpec();
+            continue;
+        }
+        size_t colon = line.find(':');
+        if (colon != std::string::npos) {
+            std::string key = line.substr(0, colon);
+            std::string val = line.substr(colon + 1);
+            val.erase(0, val.find_first_not_of(" \t"));
+            val.erase(val.find_last_not_of(" \t\r\n") + 1);
+
+            if (key == "pkgname") current.name = val;
+            else if (key == "version") current.version = val;
+            else if (key == "size") current.size = std::stoull(val);
+            else if (key == "installed_size") current.installed_size = std::stoull(val);
+            else if (key == "depends") {
+                std::string dep;
+                std::istringstream ss(val);
+                while (ss >> dep) current.depends.push_back(dep);
+            }
+        }
+    }
+    return db;
+}
+
+void cmd_install_apk(const std::string& root_dir, const std::vector<std::string>& targets) {
+    if (targets.empty()) {
+        CLI_APK::printError("Debe especificar al menos un paquete para instalar.");
+        return;
+    }
+
+    auto repo_db = loadRepoIndex(root_dir);
+    if (repo_db.empty()) {
+        CLI_APK::printError("El índice de repositorios está vacío. Ejecute 'roger-apk sync' primero.");
+        return;
+    }
+
+    DependencyResolverSAT resolver;
+    for (const auto& [name, pkg] : repo_db) {
+        resolver.addPackage(pkg);
+    }
+
+    std::vector<std::string> install_order;
+    for (const auto& target : targets) {
+        std::vector<std::string> sub_list;
+        if (!resolver.resolveInstall(target, sub_list)) {
+            CLI_APK::printError("No se pudieron resolver las dependencias para: " + target);
+            return;
+        }
+        for (const auto& pkg : sub_list) {
+            if (std::find(install_order.begin(), install_order.end(), pkg) == install_order.end()) {
+                install_order.push_back(pkg);
+            }
+        }
+    }
+
+    std::vector<std::string> deps_pkgs;
+    for (const auto& pkg : install_order) {
+        if (std::find(targets.begin(), targets.end(), pkg) == targets.end()) {
+            deps_pkgs.push_back(pkg);
+        }
+    }
+
+    // Cálculo dinámico de tamaños acumulados desde repo_db
+    uint64_t total_download_bytes = 0;
+    uint64_t total_install_bytes = 0;
+
+    for (const auto& pkg : install_order) {
+        auto it = repo_db.find(pkg);
+        if (it != repo_db.end()) {
+            total_download_bytes += it->second.size;
+            total_install_bytes += it->second.installed_size;
+        }
+    }
+
+    CLI_APK::printTransactionSummary(targets, deps_pkgs, total_download_bytes, total_install_bytes);
+
+    if (!CLI_APK::confirm("¿Desea proceder con la instalación?")) {
+        CLI_APK::printWarning("Operación cancelada por el usuario.");
+        return;
+    }
+
+    fs::path installed_dir = fs::path(root_dir) / "var/lib/roger-apk/installed";
+    fs::path cache_dir = "/root/tango-apk/pkgs";
+    fs::path extra_cache_dir = "/root/tango-apk/pkgs-extra";
+
+    fs::create_directories(installed_dir);
+    fs::create_directories(cache_dir);
+
+    // Mirrors apuntando a la rama edge coincidente con el APKINDEX de junio de 2026
+    const std::string mirror_main = "https://dl-cdn.alpinelinux.org/alpine/edge/main/x86_64/";
+    const std::string mirror_comm = "https://dl-cdn.alpinelinux.org/alpine/edge/community/x86_64/";
+
+    for (size_t i = 0; i < install_order.size(); ++i) {
+        const auto& pkg = install_order[i];
+        CLI_APK::showProgressBar(i + 1, install_order.size(), "Instalando " + pkg);
+
+        std::string version = repo_db[pkg].version;
+        std::string filename = pkg + "-" + version + ".apk";
+
+        fs::path apk_path = cache_dir / filename;
+
+        // 1. Verificar si existe localmente (en pkgs/ o pkgs-extra/)
+        if (!fs::exists(apk_path) && fs::exists(extra_cache_dir / filename)) {
+            apk_path = extra_cache_dir / filename;
+        }
+
+        // 2. Si no existe en ningún directorio local, se descarga mediante curl
+        if (!fs::exists(apk_path)) {
+            std::string fetch_cmd = "curl -s -f -L " + mirror_main + filename + " -o " + apk_path.string() +
+                                    " || curl -s -f -L " + mirror_comm + filename + " -o " + apk_path.string();
+            int res = std::system(fetch_cmd.c_str());
+
+            if (res != 0 || !fs::exists(apk_path)) {
+                CLI_APK::printError("No se pudo descargar el paquete desde los mirrors: " + filename);
+                return;
+            }
+        }
+
+        // 3. Extraer el paquete .apk en la raíz del sistema
+        std::string extract_cmd = "tar -xzf " + apk_path.string() + " -C " + root_dir + " 2>/dev/null";
+        std::system(extract_cmd.c_str());
+
+        // 4. Guardar metadatos de instalación
+        std::ofstream meta(installed_dir / (pkg + ".meta"));
+        meta << "pkgname: " << pkg << "\n";
+        meta << "version: " << version << "\n";
+        meta << "explicit: " << (std::find(targets.begin(), targets.end(), pkg) != targets.end() ? "1" : "0") << "\n";
+        meta.close();
+    }
+
+    CLI_APK::printSuccess("Instalación completada con éxito.");
+}
+
+} // namespace RogerAPK
+
+
+=== ARCHIVO: /root/tango-apk/src/sync-apk.hpp ===
+#ifndef SYNC_APK_HPP
+#define SYNC_APK_HPP
+
+#include <string>
+
+namespace RogerAPK {
+
+void cmd_sync_apk(const std::string& root_dir);
+void cmd_update_apk(const std::string& root_dir);
+
+} // namespace RogerAPK
+
+#endif // SYNC_APK_HPP
+
+
+=== ARCHIVO: /root/tango-apk/src/roger-apk.cpp ===
+#include "rogersat-apk.hpp"
+#include "cli-apk.hpp"
+#include "list-apk.hpp"
+#include "sync-apk.hpp"
+#include "install-apk.hpp"
+#include "delete-apk.hpp"
+#include "upgrade-apk.hpp"
+#include "bomb-apk.hpp"
+
+#include <iostream>
+#include <string>
+#include <vector>
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        CLI_APK::printInfo("Uso: roger-apk <comando> [opciones/paquetes]");
+        CLI_APK::printInfo("Comandos disponibles: sync, update, install, delete, upgrade, bomb, list");
+        return 1;
+    }
+
+    std::string command = argv[1];
+    std::vector<std::string> args;
+    for (int i = 2; i < argc; ++i) {
+        args.push_back(argv[i]);
+    }
+
+    const std::string root_dir = "/";
+
+    if (command == "sync") {
+        RogerAPK::cmd_sync_apk(root_dir);
+    } else if (command == "update") {
+        RogerAPK::cmd_update_apk(root_dir);
+    } else if (command == "install") {
+        RogerAPK::cmd_install_apk(root_dir, args);
+    } else if (command == "delete" || command == "remove") {
+        RogerAPK::cmd_delete_apk(root_dir, args);
+    } else if (command == "upgrade") {
+        RogerAPK::cmd_upgrade_apk(root_dir);
+    } else if (command == "bomb") {
+        RogerAPK::cmd_bomb_apk(root_dir);
+    } else if (command == "list") {
+        cmd_list_apk(root_dir);
+    } else {
+        CLI_APK::printError("Comando desconocido: " + command);
+        return 1;
+    }
+
+    return 0;
+}
+
+
+=== ARCHIVO: /root/tango-apk/src/Makefile ===
+CXX = g++
+CXXFLAGS = -std=c++17 -Wall -Wextra -O2
+LDFLAGS = -lminisat
+
+TARGET = roger-apk
+SRCS = roger-apk.cpp cli-apk.cpp list-apk.cpp sync-apk.cpp install-apk.cpp delete-apk.cpp upgrade-apk.cpp bomb-apk.cpp
+OBJS = $(SRCS:.cpp=.o)
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CXX) $(OBJS) -o $(TARGET) $(LDFLAGS)
+
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+clean:
+	rm -f $(OBJS) $(TARGET)
+
+.PHONY: all clean
+
+
+=== ARCHIVO: /root/tango-apk/src/upgrade-apk.hpp ===
+#ifndef UPGRADE_APK_HPP
+#define UPGRADE_APK_HPP
+
+#include <string>
+
+namespace RogerAPK {
+
+void cmd_upgrade_apk(const std::string& root_dir);
+
+} // namespace RogerAPK
+
+#endif // UPGRADE_APK_HPP
+
+

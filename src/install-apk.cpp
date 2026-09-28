@@ -66,7 +66,7 @@ void cmd_install_apk(const std::string& root_dir, const std::vector<std::string>
         resolver.addPackage(pkg);
     }
 
-    std::vector<std::string> install_order;
+    std::vector<std::string> raw_install_order;
     for (const auto& target : targets) {
         std::vector<std::string> sub_list;
         if (!resolver.resolveInstall(target, sub_list)) {
@@ -74,10 +74,24 @@ void cmd_install_apk(const std::string& root_dir, const std::vector<std::string>
             return;
         }
         for (const auto& pkg : sub_list) {
-            if (std::find(install_order.begin(), install_order.end(), pkg) == install_order.end()) {
-                install_order.push_back(pkg);
+            if (std::find(raw_install_order.begin(), raw_install_order.end(), pkg) == raw_install_order.end()) {
+                raw_install_order.push_back(pkg);
             }
         }
+    }
+
+    // Filtrar paquetes que ya están instalados previamente en la raíz
+    fs::path installed_dir = fs::path(root_dir) / "var/lib/roger-apk/installed";
+    std::vector<std::string> install_order;
+    for (const auto& pkg : raw_install_order) {
+        if (!fs::exists(installed_dir / (pkg + ".meta"))) {
+            install_order.push_back(pkg);
+        }
+    }
+
+    if (install_order.empty()) {
+        CLI_APK::printInfo("Todos los paquetes requeridos ya están instalados.");
+        return;
     }
 
     std::vector<std::string> deps_pkgs;
@@ -87,7 +101,7 @@ void cmd_install_apk(const std::string& root_dir, const std::vector<std::string>
         }
     }
 
-    // Cálculo dinámico de tamaños acumulados desde repo_db
+    // Cálculo dinámico de tamaños acumulados
     uint64_t total_download_bytes = 0;
     uint64_t total_install_bytes = 0;
 
@@ -106,54 +120,50 @@ void cmd_install_apk(const std::string& root_dir, const std::vector<std::string>
         return;
     }
 
-    fs::path installed_dir = fs::path(root_dir) / "var/lib/roger-apk/installed";
-    fs::path cache_dir = "/root/tango-apk/pkgs";
-    fs::path extra_cache_dir = "/root/tango-apk/pkgs-extra";
-
+    // Usar un directorio de caché temporal para la sesión
+    fs::path temp_cache = "/tmp/roger-apk-cache";
+    fs::create_directories(temp_cache);
     fs::create_directories(installed_dir);
-    fs::create_directories(cache_dir);
 
-    // Mirrors apuntando a la rama edge coincidente con el APKINDEX de junio de 2026
     const std::string mirror_main = "https://dl-cdn.alpinelinux.org/alpine/edge/main/x86_64/";
     const std::string mirror_comm = "https://dl-cdn.alpinelinux.org/alpine/edge/community/x86_64/";
 
     for (size_t i = 0; i < install_order.size(); ++i) {
         const auto& pkg = install_order[i];
-        CLI_APK::showProgressBar(i + 1, install_order.size(), "Instalando " + pkg);
+        CLI_APK::showProgressBar(i + 1, install_order.size(), "Descargando e instalando " + pkg);
 
         std::string version = repo_db[pkg].version;
         std::string filename = pkg + "-" + version + ".apk";
+        fs::path temp_apk_path = temp_cache / filename;
 
-        fs::path apk_path = cache_dir / filename;
+        // 1. Descargar directamente desde el mirror oficial a /tmp
+        std::string fetch_cmd = "curl -s -f -L " + mirror_main + filename + " -o " + temp_apk_path.string() +
+                                " || curl -s -f -L " + mirror_comm + filename + " -o " + temp_apk_path.string();
 
-        // 1. Verificar si existe localmente (en pkgs/ o pkgs-extra/)
-        if (!fs::exists(apk_path) && fs::exists(extra_cache_dir / filename)) {
-            apk_path = extra_cache_dir / filename;
+        int res = std::system(fetch_cmd.c_str());
+        if (res != 0 || !fs::exists(temp_apk_path)) {
+            CLI_APK::printError("No se pudo descargar el paquete desde los mirrors: " + filename);
+            fs::remove_all(temp_cache);
+            return;
         }
 
-        // 2. Si no existe en ningún directorio local, se descarga mediante curl
-        if (!fs::exists(apk_path)) {
-            std::string fetch_cmd = "curl -s -f -L " + mirror_main + filename + " -o " + apk_path.string() +
-                                    " || curl -s -f -L " + mirror_comm + filename + " -o " + apk_path.string();
-            int res = std::system(fetch_cmd.c_str());
-
-            if (res != 0 || !fs::exists(apk_path)) {
-                CLI_APK::printError("No se pudo descargar el paquete desde los mirrors: " + filename);
-                return;
-            }
-        }
-
-        // 3. Extraer el paquete .apk en la raíz del sistema
-        std::string extract_cmd = "tar -xzf " + apk_path.string() + " -C " + root_dir + " 2>/dev/null";
+        // 2. Extraer el paquete .apk en la raíz del sistema target
+        std::string extract_cmd = "tar -xzf " + temp_apk_path.string() + " -C " + root_dir + " 2>/dev/null";
         std::system(extract_cmd.c_str());
 
-        // 4. Guardar metadatos de instalación
+        // 3. Borrar el archivo .apk descargado inmediatamente
+        fs::remove(temp_apk_path);
+
+        // 4. Registrar metadatos de instalación
         std::ofstream meta(installed_dir / (pkg + ".meta"));
         meta << "pkgname: " << pkg << "\n";
         meta << "version: " << version << "\n";
         meta << "explicit: " << (std::find(targets.begin(), targets.end(), pkg) != targets.end() ? "1" : "0") << "\n";
         meta.close();
     }
+
+    // Limpieza del directorio temporal
+    fs::remove_all(temp_cache);
 
     CLI_APK::printSuccess("Instalación completada con éxito.");
 }
